@@ -13,10 +13,16 @@ def create_keyboard(*keys,row_width=2,resize_keyboard=True):
 keys = SimpleNamespace(
     random_connect=":bust_in_silhouette: Random Connect",
     settings=":gear: Settings",
+    exit=":cross_mark: Exit",
 )
 
 
 
 keyboards = SimpleNamespace(
-    main=create_keyboard(keys.random_connect,keys.settings)
+    main=create_keyboard(keys.random_connect,keys.settings),
+    exit=create_keyboard(keys.exit)
+
+)
+states = SimpleNamespace(
+    main="MAIN",
 )
