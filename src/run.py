@@ -1,258 +1,238 @@
+import re
+import sys
+import time
+from typing import Union
+
 import emoji
 from bson.objectid import ObjectId
 from loguru import logger
-from telebot import custom_filters
+from telebot import custom_filters, types
 
-from src import constants
-from src.answer import Answer
 from src.bot import bot
-from src.constants import inline_keys, keyboards, keys, post_status, states
+from src.constants import (DELETE_BOT_MESSAGES_AFTER_TIME,
+                           DELETE_FILE_MESSAGES_AFTER_TIME)
 from src.db import db
 from src.filters import IsAdmin
-from src.post import Post
-from src.question import Question
-from src.user import User
+from src.handlers import CallbackHandler, CommandHandler, MessageHandler
 
+logger.remove()
+logger.add(sys.stderr, format="{time} {level} {message}", level="ERROR")
 
 class StackBot:
     """
-    Template for telegram bot.
-    """
-    def __init__(self, telebot, mongodb):
-        self.bot = telebot
-        self.db = mongodb
+    Stackoverflow Telegram Bot.
 
-        # add custom filters
+    Using the Telegram Bot API, users can interact with each other to ask questions,
+    comment, and answer.
+    """
+    def __init__(self, telebot, db):
+        self.bot = telebot
+        self.db = db
+
+        # Add custom filters
         self.bot.add_custom_filter(IsAdmin())
         self.bot.add_custom_filter(custom_filters.TextMatchFilter())
         self.bot.add_custom_filter(custom_filters.TextStartsFilter())
 
-        # question object to handle send/recieve questions
-        self.question = Question(mongodb=self.db, stackbot=self)
-        self.answer = Answer(mongodb=self.db, stackbot=self)
+        # User (user can be None when bot is not used by a user, but
+        # used for sending messages in general)
+        self.user = None
 
-        # register handlers
-        self.handlers()
+        # Note: The order of handlers matters as the first
+        # handler that matches a message will be executed.
+        self.handlers = [
+            CommandHandler(stackbot=self, db=self.db),
+            MessageHandler(stackbot=self, db=self.db),
+            CallbackHandler(stackbot=self, db=self.db),
+        ]
+        self.register()
 
     def run(self):
         # run bot with polling
         logger.info('Bot is running...')
         self.bot.infinity_polling()
 
-    def get_callback_post(self, call):
-        post_type = self.get_call_info(call)['post_type']
-        if post_type == 'question':
-            return self.question
-        elif post_type == 'answer':
-            return self.answer
+    def register(self):
+        for handler in self.handlers:
+            handler.register()
 
-    def get_message_post(self):
-        if self.user.state == states.ASK_QUESTION:
-            return self.question
-        elif self.user.state == states.ANSWER_QUESTION:
-            return self.answer
-
-        return Post(mongodb=self.db, stackbot=self)
-
-    def handlers(self):
-        @self.bot.message_handler(commands=['start'])
-        def start(message):
-            """
-            /start command handler.
-            """
-            self.user.send_message(constants.WELCOME_MESSAGE.format(**vars(self.user)), reply_markup=keyboards.main)
-            self.db.users.update_one({'chat.id': message.chat.id}, {'$set': message.json}, upsert=True)
-            self.user.reset()
-
-        @self.bot.middleware_handler(update_types=['message'])
-        def init_handler(bot_instance, message):
-            """
-            Initialize user to use in other handlers.
-            """
-            # Getting updated user before message reaches any other handler
-            self.user = User(chat_id=message.chat.id, mongodb=self.db, stackbot=self, message=message)
-            if not self.user.exists():
-                self.user.reset()
-                return
-
-            # self.post could be either question or answer handler
-            # Answer() or Question() classes are inherited from Post() class
-            self.post = self.get_message_post()
-
-            # Demojize text
-            if message.content_type == 'text':
-                message.text = emoji.demojize(message.text)
-
-        @self.bot.middleware_handler(update_types=['callback_query'])
-        def init_callback_handler(bot_instance, call):
-            """
-            Initialize user to use in other handlers.
-            """
-            # Getting updated user before message reaches any other handler
-            self.user = User(chat_id=call.message.chat.id, mongodb=self.db, stackbot=self, message=call.message)
-            self.post = self.get_callback_post(call)
-
-            # Getting updated user before message reaches any other handler
-            call.data = emoji.demojize(call.data)
-
-        @self.bot.message_handler(text=[keys.ask_question])
-        def ask_question(message):
-            """
-            Users starts sending question.
-            """
-            if not self.user.state == states.MAIN:
-                return
-
-            self.user.update_state(states.ASK_QUESTION)
-            self.user.send_message(constants.HOW_TO_ASK_QUESTION_GUIDE, reply_markup=keyboards.ask_question)
-            self.user.send_message(constants.ASK_QUESTION_START_MESSAGE.format(**vars(self.user)))
-
-        @self.bot.message_handler(text=[keys.cancel])
-        def cancel(message):
-            """
-            User cancels sending a post.
-            """
-            self.user.reset()
-            self.user.send_message(constants.CANCEL_MESSAGE, reply_markup=keyboards.main)
-
-        @self.bot.message_handler(text=[keys.send_question, keys.send_answer])
-        def send_post(message):
-            """
-            User sends a post.
-            """
-            self.post.submit(chat_id=message.chat.id)
-            self.user.send_message(
-                text=constants.POST_OPEN_SUCCESS_MESSAGE.format(
-                    post_type=self.post.post_type.title(),
-                ),
-                reply_markup=keyboards.main
-            )
-
-            # Reset user state and data
-            self.user.reset()
-
-        # Handles all other messages with the supported content_types
-        @bot.message_handler(content_types=constants.SUPPORTED_CONTENT_TYPES)
-        def echo(message):
-            """
-            Respond to user according to the current user state.
-            """
-            self.user.send_message(f'State: <strong>{self.user.state}</strong>')
-            if self.user.state not in [states.ASK_QUESTION, states.ANSWER_QUESTION]:
-                return
-
-            post_metadata = dict()
-            if self.user.state == states.ANSWER_QUESTION:
-                post_metadata.update({'question_id': self.user.tracker['post_id']})
-
-            post_id = self.post.update(message, post_metadata)
-            self.post.send_to_one(post_id=post_id, chat_id=message.chat.id, preview=True)
-
-        @bot.callback_query_handler(func=lambda call: call.data == inline_keys.actions)
-        def actions_callback(call):
-            """Actions >> inline key callback.
-
-            Questions/Answers actions include follow, unfollow, answer, delete, etc.
-            """
-            self.bot.answer_callback_query(call.id, text=inline_keys.actions)
-
-            # actions keyboard'
-            post_id = self.get_call_info(call)['post_id']
-            reply_markup = self.post.get_actions_keyboard(post_id, call.message.chat.id)
-
-            self.bot.edit_message_reply_markup(
-                call.message.chat.id, call.message.message_id,
-                reply_markup=reply_markup,
-            )
-
-        @bot.callback_query_handler(func=lambda call: call.data == inline_keys.answer)
-        def answer_callback(call):
-            """
-            Answer inline key callback.
-            """
-            self.bot.answer_callback_query(call.id, text=emoji.emojize(inline_keys.answer))
-
-            # we store empty answer in db to track the question_id we are answering
-            question_id = self.get_call_info(call)['post_id']
-            self.user.track(action_on='question', post_id=question_id)
-
-            self.user.update_state(states.ANSWER_QUESTION)
-            self.user.send_message(
-                constants.ANSWER_QUESTION_START_MESSAGE.format(**vars(self.user)),
-                reply_markup=keyboards.answer_question
-            )
-
-        @bot.callback_query_handler(func=lambda call: call.data == inline_keys.back)
-        def back_callback(call):
-            """
-            Back inline key callback.
-            """
-            self.bot.answer_callback_query(call.id, text=inline_keys.back)
-
-            # main menu keyboard
-            post_id = self.get_call_info(call)['post_id']
-            self.bot.edit_message_reply_markup(
-                call.message.chat.id, call.message.message_id,
-                reply_markup=self.post.get_keyboard(post_id=post_id)
-            )
-
-        @bot.callback_query_handler(func=lambda call: call.data == inline_keys.like)
-        def like_callback(call):
-            self.bot.answer_callback_query(call.id, text=emoji.emojize(inline_keys.like))
-
-            # add user chat_id to likes
-            question_id = self.get_call_info(call)['post_id']
-            self.post.like(call.message.chat.id, question_id)
-            self.bot.edit_message_reply_markup(
-                call.message.chat.id, call.message.message_id,
-                reply_markup=self.post.get_keyboard(post_id=question_id)
-            )
-
-        @bot.callback_query_handler(func=lambda call: True)
-        def send_file(call):
-            """
-            Send file callback. Callback data is file_unique_id. We use this to get file from telegram database.
-            """
-            self.bot.answer_callback_query(call.id, text=f'Sending file: {call.data}...')
-            self.send_file(call.message.chat.id, call.data, message_id=call.message.message_id)
-
-    def send_message(self, chat_id, text, reply_markup=None, emojize=True):
+    def send_message(
+        self, chat_id: int, text: str,
+        reply_markup: Union[types.ReplyKeyboardMarkup, types.InlineKeyboardMarkup] = None,
+        emojize: bool = True,
+        delete_after: Union[int, bool] = DELETE_BOT_MESSAGES_AFTER_TIME,
+        auto_update: bool = False,
+    ):
         """
         Send message to telegram bot having a chat_id and text_content.
+
+        :param chat_id: Chat id of the user.
+        :param text: Text content of the message.
+        :param reply_markup: Reply markup of the message.
+        :param emojize: Emojize the text.
+        :param delete_after: Auto delete message in seconds.
         """
         text = emoji.emojize(text) if emojize else text
         message = self.bot.send_message(chat_id, text, reply_markup=reply_markup)
 
+        if auto_update:
+            self.queue_message_update(chat_id, message.message_id)
+
+        if (type(delete_after) == int) and isinstance(reply_markup, types.ReplyKeyboardMarkup):
+            # We need to keep the message which generated main keyboard so that
+            # it does not go away. Otherwise, the user will be confused and won't have
+            # any keyboaard to interact with.
+            # To indicate this message, we set its delete_after to -1.
+            logger.warning(f'Setting delete_after to -1 for message with message_id: {message.message_id}')
+            delete_after = -1
+            self.db.auto_delete.update_many(
+                {'chat_id': chat_id, 'delete_after': -1},
+                {'$set': {'delete_after': 1}}
+            )
+            self.queue_message_deletion(chat_id, message.message_id, delete_after)
+        elif delete_after:
+            self.queue_message_deletion(chat_id, message.message_id, delete_after)
+
+        # If user is None, we don't have to update any callback data.
+        # The message is sent by the bot and not by the user.
+        if self.user is not None:
+            self.update_callback_data(chat_id, message.message_id, reply_markup)
+        else:
+            logger.warning("User is None, callback data won't be updated.")
+
         return message
 
-    def send_file(self, chat_id, file_unique_id, message_id=None):
+    def edit_message(
+        self, chat_id: int, message_id: int, text: str = None,
+        reply_markup: Union[types.ReplyKeyboardMarkup, types.InlineKeyboardMarkup] = None,
+        emojize: bool = True,
+    ):
+        """
+        Edit telegram message text and/or reply_markup.
+        """
+        if emojize and text:
+            text = emoji.emojize(text)
+
+        # if message text or reply_markup is the same as before, telegram raises an invalid request error
+        # so we are doing try/catch to avoid this.
+        try:
+            if text and reply_markup:
+                self.bot.edit_message_text(text=text, reply_markup=reply_markup, chat_id=chat_id, message_id=message_id)
+            elif reply_markup:
+                self.bot.edit_message_reply_markup(chat_id=chat_id, message_id=message_id, reply_markup=reply_markup)
+            elif text:
+                self.bot.edit_message_text(text=text, chat_id=chat_id, message_id=message_id)
+
+            self.update_callback_data(chat_id, message_id, reply_markup)
+        except Exception as e:
+            logger.debug(f'Error editing message: {e}')
+
+    def delete_message(self, chat_id: int, message_id: int):
+        """
+        Delete bot message.
+        """
+        try:
+            self.bot.delete_message(chat_id, message_id)
+
+            # Delete message trace from all collections.
+            self.db.callback_data.delete_many({'chat_id': chat_id, 'message_id': message_id})
+            self.db.auto_update.delete_many({'chat_id': chat_id, 'message_id': message_id})
+            self.db.auto_delete.delete_many({'chat_id': chat_id, 'message_id': message_id})
+        except Exception as e:
+            logger.debug(f'Error deleting message: {e}')
+
+    def send_file(
+        self, chat_id: int, file_unique_id: str, message_id: int = None,
+        delete_after=DELETE_FILE_MESSAGES_AFTER_TIME
+    ):
         """
         Send file to telegram bot having a chat_id and file_id.
         """
-        file_id, content_type, mime_type = self.file_unique_id_to_content(file_unique_id)
+        attachment = self.file_unique_id_to_metadata(file_unique_id)
+        if not attachment:
+            return
 
-        # Send file to user with the appropriate send_file method according to the content_type
-        send_method = getattr(self.bot, f'send_{content_type}')
-        send_method(
+        file_id, attachment_type, mime_type = attachment['file_id'], attachment['content_type'], attachment.get('mime_type')
+
+        # Send file to user with the appropriate send_file method according to the attachment_type
+        send_method = getattr(self.bot, f'send_{attachment_type}')
+        message = send_method(
             chat_id, file_id,
             reply_to_message_id=message_id,
             caption=f"<code>{mime_type or ''}</code>",
         )
 
-    def file_unique_id_to_content(self, file_unique_id):
-        collections = ['questions', 'answers']
-        for collection in collections:
-            collection = getattr(self.db, collection)
-            query_result = collection.find_one({'content.file_unique_id': file_unique_id}, {'content.$': 1})
-            content = query_result['content'][0]
+        self.queue_message_deletion(chat_id, message.message_id, delete_after)
 
-            return content['file_id'], content['content_type'], content.get('mime_type')
+    def file_unique_id_to_metadata(self, file_unique_id: str):
+        """
+        Get file metadata having a file_id.
+        """
+        query_result = self.db.post.find_one({'attachments.file_unique_id': file_unique_id}, {'attachments.$': 1})
+        if not query_result:
+            return
 
-    def get_call_info(self, call):
-        return self.db.callback_data.find_one({'chat_id': call.message.chat.id, 'message_id': call.message.message_id})
+        return query_result['attachments'][0]
 
+    def retrive_post_id_from_message_text(self, text: str):
+        """
+        Get post_id from message text.
+        """
+        text = emoji.demojize(text)
+        last_line = text.split('\n')[-1]
+        pattern = '^:ID_button: (?P<id>[A-Za-z0-9]+)$'
+        match = re.match(pattern, last_line)
+        post_id = match.group('id') if match else None
+        return ObjectId(post_id)
+
+    def queue_message_deletion(self, chat_id: int, message_id: int, delete_after: Union[int, bool]):
+        self.db.auto_delete.insert_one({
+            'chat_id': chat_id, 'message_id': message_id,
+            'delete_after': delete_after, 'created_at': time.time(),
+        })
+
+    def queue_message_update(self, chat_id: int, message_id: int):
+        self.db.auto_update.insert_one({
+            'chat_id': chat_id, 'message_id': message_id, 'created_at': time.time(),
+        })
+
+    def update_callback_data(
+        self, chat_id: int, message_id: int,
+        reply_markup: Union[types.ReplyKeyboardMarkup, types.InlineKeyboardMarkup]
+    ):
+        if reply_markup and isinstance(reply_markup, types.InlineKeyboardMarkup):
+
+            # If the reply_markup is an inline keyboard with actions button, it is the main keyboard and
+            # we update its data once in a while to keep it fresh with number of likes, etc.
+            buttons = []
+            for sublist in reply_markup.keyboard:
+                sub_buttons = map(lambda button: emoji.demojize(button.text), sublist)
+                buttons.extend(list(sub_buttons))
+
+            self.db.callback_data.update_one(
+                {
+                    'chat_id': chat_id,
+                    'message_id': message_id,
+                    'post_id': self.user.post.post_id,
+                },
+                {
+                    '$set': {
+                        'is_gallery': self.user.post.is_gallery,
+                        'gallery_filters': self.user.post.gallery_filters,
+
+                        # We need the buttons to check to not update it asynchroneously
+                        # with the wrong keys.
+                        'buttons': buttons,
+
+                        # We need the date of the callback data update to get the current active post on
+                        # the gallery for refreshing post info such as likes, answers, etc.
+                        'created_at': time.time()
+                    }
+                },
+                upsert=True
+            )
 
 if __name__ == '__main__':
     logger.info('Bot started...')
-    stackbot = StackBot(telebot=bot, mongodb=db)
+    stackbot = StackBot(telebot=bot, db=db)
     stackbot.run()
